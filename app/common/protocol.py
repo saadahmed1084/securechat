@@ -71,9 +71,11 @@ class Message(BaseModel):
 class Receipt(BaseModel):
     """Session receipt for non-repudiation."""
     type: str = Field(default="receipt", description="Message type")
-    session_id: str = Field(description="Session identifier")
-    transcript_hash: str = Field(description="SHA256 hash of transcript")
-    signature: str = Field(description="Receipt signature (base64 encoded)")
+    peer: str = Field(description="Peer identifier: 'client' or 'server'")
+    first_seq: int = Field(description="First sequence number in transcript")
+    last_seq: int = Field(description="Last sequence number in transcript")
+    transcript_sha256: str = Field(description="SHA256 hash of transcript (hex)")
+    sig: str = Field(description="RSA signature of transcript hash (base64 encoded)")
 
 
 class ErrorResponse(BaseModel):

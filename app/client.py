@@ -16,10 +16,12 @@ from app.common.protocol import (
     LoginResponse,
     SessionKeyEstablished,
     Message,
+    Receipt,
     ErrorResponse,
 )
 from app.common.utils import b64d, b64e
-from app.crypto import auth, dh, message, pki
+from app.crypto import auth, dh, message, pki, receipt
+from app.storage import transcript
 
 
 def load_client_certificate(cert_path: Path) -> bytes:
@@ -28,7 +30,7 @@ def load_client_certificate(cert_path: Path) -> bytes:
         return f.read()
 
 
-def chat_loop(sock: socket.socket, session_key: bytes, client_key_path: Path):
+def chat_loop(sock: socket.socket, session_key: bytes, client_key_path: Path, server_cert):
     """
     Chat loop: send and receive encrypted messages.
     
@@ -36,8 +38,28 @@ def chat_loop(sock: socket.socket, session_key: bytes, client_key_path: Path):
         sock: Open socket connection to server
         session_key: AES-128 session key for encryption
         client_key_path: Path to client's private key for signing
+        server_cert: Server's X.509 certificate
     """
     import threading
+    import time
+    
+    # Create transcript file for this session
+    transcripts_dir = Path("transcripts")
+    server_cn = pki.get_certificate_cn(server_cert) or "unknown"
+    session_id = f"client_{int(time.time())}_{server_cn}"
+    transcript_path = transcripts_dir / f"{session_id}.txt"
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get server certificate fingerprint
+    server_cert_fingerprint = transcript.get_certificate_fingerprint(server_cert)
+    
+    # Get client certificate fingerprint
+    certs_dir = Path("certs")
+    client_cert_path = certs_dir / "client_cert.pem"
+    from cryptography import x509
+    with open(client_cert_path, "rb") as f:
+        client_cert = x509.load_pem_x509_certificate(f.read())
+    client_cert_fingerprint = transcript.get_certificate_fingerprint(client_cert)
     
     seqno = 0
     expected_seqno = 0
@@ -94,8 +116,46 @@ def chat_loop(sock: socket.socket, session_key: bytes, client_key_path: Path):
                     if success:
                         expected_seqno = msg.seqno
                         print(f"\n[Server] [{msg.seqno}]: {plaintext}")
+                        
+                        # Log to transcript: seqno | timestamp | ciphertext | sig | peer-cert-fingerprint
+                        transcript.append_to_transcript(
+                            transcript_path=transcript_path,
+                            seqno=msg.seqno,
+                            timestamp=msg.ts,
+                            ciphertext_b64=msg.ct,
+                            signature_b64=msg.sig,
+                            peer_cert_fingerprint=server_cert_fingerprint
+                        )
                     else:
                         print(f"\n✗ Message verification failed: {error_msg}")
+                
+                elif msg_type == "receipt":
+                    # Handle server's session receipt
+                    try:
+                        server_receipt = Receipt.model_validate(msg_json)
+                        
+                        # Verify server's receipt
+                        is_valid, error_msg = receipt.verify_session_receipt(
+                            receipt=server_receipt,
+                            transcript_path=transcript_path,
+                            signer_certificate=server_cert
+                        )
+                        
+                        if is_valid:
+                            print(f"\n✓ Server receipt verified: seq {server_receipt.first_seq}-{server_receipt.last_seq}")
+                            print(f"  Transcript hash: {server_receipt.transcript_sha256[:16]}...")
+                            
+                            # Save receipt to file
+                            receipt_path = transcript_path.parent / f"{transcript_path.stem}_server_receipt.json"
+                            with open(receipt_path, "w") as f:
+                                f.write(server_receipt.model_dump_json(indent=2))
+                        else:
+                            print(f"\n✗ Server receipt verification failed: {error_msg}")
+                    
+                    except Exception as e:
+                        print(f"\n✗ Error processing server receipt: {e}")
+                        import traceback
+                        traceback.print_exc()
                 
                 elif msg_type == "error":
                     error = ErrorResponse.model_validate(msg_json)
@@ -126,6 +186,22 @@ def chat_loop(sock: socket.socket, session_key: bytes, client_key_path: Path):
                 
                 if plaintext.lower() in ['quit', 'exit']:
                     print("Disconnecting...")
+                    # Generate and send client receipt before disconnecting
+                    client_receipt = receipt.generate_session_receipt(
+                        transcript_path=transcript_path,
+                        peer="client",
+                        private_key_path=client_key_path
+                    )
+                    
+                    if client_receipt:
+                        sock.send(client_receipt.model_dump_json().encode('utf-8'))
+                        print(f"✓ Client receipt sent: seq {client_receipt.first_seq}-{client_receipt.last_seq}")
+                        print(f"  Transcript hash: {client_receipt.transcript_sha256[:16]}...")
+                        
+                        # Save receipt to file
+                        receipt_path = transcript_path.parent / f"{transcript_path.stem}_client_receipt.json"
+                        receipt.save_receipt(client_receipt, receipt_path)
+                        print(f"✓ Client receipt saved to: {receipt_path}")
                     break
                 
                 if not plaintext.strip():
@@ -152,14 +228,58 @@ def chat_loop(sock: socket.socket, session_key: bytes, client_key_path: Path):
                 
                 sock.send(msg.model_dump_json().encode('utf-8'))
                 print(f"✓ Message [{seqno}] sent")
+                
+                # Log to transcript: seqno | timestamp | ciphertext | sig | peer-cert-fingerprint
+                transcript.append_to_transcript(
+                    transcript_path=transcript_path,
+                    seqno=seqno,
+                    timestamp=timestamp,
+                    ciphertext_b64=ciphertext_b64,
+                    signature_b64=signature_b64,
+                    peer_cert_fingerprint=server_cert_fingerprint
+                )
             
             except EOFError:
                 # Handle Ctrl+D
                 print("\nDisconnecting...")
+                # Generate and send client receipt before disconnecting
+                try:
+                    client_receipt = receipt.generate_session_receipt(
+                        transcript_path=transcript_path,
+                        peer="client",
+                        private_key_path=client_key_path
+                    )
+                    
+                    if client_receipt:
+                        sock.send(client_receipt.model_dump_json().encode('utf-8'))
+                        print(f"✓ Client receipt sent: seq {client_receipt.first_seq}-{client_receipt.last_seq}")
+                        
+                        # Save receipt to file
+                        receipt_path = transcript_path.parent / f"{transcript_path.stem}_client_receipt.json"
+                        receipt.save_receipt(client_receipt, receipt_path)
+                except:
+                    pass
                 break
             except KeyboardInterrupt:
                 # Handle Ctrl+C
                 print("\nDisconnecting...")
+                # Generate and send client receipt before disconnecting
+                try:
+                    client_receipt = receipt.generate_session_receipt(
+                        transcript_path=transcript_path,
+                        peer="client",
+                        private_key_path=client_key_path
+                    )
+                    
+                    if client_receipt:
+                        sock.send(client_receipt.model_dump_json().encode('utf-8'))
+                        print(f"✓ Client receipt sent: seq {client_receipt.first_seq}-{client_receipt.last_seq}")
+                        
+                        # Save receipt to file
+                        receipt_path = transcript_path.parent / f"{transcript_path.stem}_client_receipt.json"
+                        receipt.save_receipt(client_receipt, receipt_path)
+                except:
+                    pass
                 break
             except Exception as e:
                 print(f"\n✗ Error sending message: {e}")

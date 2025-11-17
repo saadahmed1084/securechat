@@ -15,10 +15,12 @@ from app.common.protocol import (
     LoginResponse,
     SessionKeyEstablished,
     Message,
+    Receipt,
     ErrorResponse,
 )
 from app.common.utils import b64d, b64e
-from app.crypto import auth, dh, message, pki
+from app.crypto import auth, dh, message, pki, receipt
+from app.storage import transcript
 
 
 def load_server_certificate(cert_path: Path) -> bytes:
@@ -243,6 +245,17 @@ def handle_client_connection(client_socket: socket.socket, client_address: tuple
                 # Enter chat message handling loop
                 print(f"✓ Session established. Ready for chat messages.")
                 
+                # Create transcript file for this session
+                transcripts_dir = Path("transcripts")
+                client_cn = pki.get_certificate_cn(client_cert) or "unknown"
+                import time
+                session_id = f"server_{int(time.time())}_{client_cn}"
+                transcript_path = transcripts_dir / f"{session_id}.txt"
+                transcripts_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Get client certificate fingerprint
+                client_cert_fingerprint = transcript.get_certificate_fingerprint(client_cert)
+                
                 # Track sequence numbers for replay protection
                 expected_seqno = 0
                 
@@ -287,6 +300,16 @@ def handle_client_connection(client_socket: socket.socket, client_address: tuple
                             if success:
                                 expected_seqno = msg.seqno
                                 print(f"✓ Message [{msg.seqno}] from {pki.get_certificate_cn(client_cert)}: {plaintext}")
+                                
+                                # Log to transcript: seqno | timestamp | ciphertext | sig | peer-cert-fingerprint
+                                transcript.append_to_transcript(
+                                    transcript_path=transcript_path,
+                                    seqno=msg.seqno,
+                                    timestamp=msg.ts,
+                                    ciphertext_b64=msg.ct,
+                                    signature_b64=msg.sig,
+                                    peer_cert_fingerprint=client_cert_fingerprint
+                                )
                             else:
                                 print(f"✗ Message verification failed: {error_msg}")
                                 # Send error response
@@ -299,6 +322,60 @@ def handle_client_connection(client_socket: socket.socket, client_address: tuple
                                 client_socket.send(error.model_dump_json().encode('utf-8'))
                                 # Continue to receive next message
                                 continue
+                        
+                        elif msg_type == "receipt":
+                            # Handle client's session receipt
+                            try:
+                                client_receipt = Receipt.model_validate(msg_json)
+                                
+                                # Verify client's receipt
+                                is_valid, error_msg = receipt.verify_session_receipt(
+                                    receipt=client_receipt,
+                                    transcript_path=transcript_path,
+                                    signer_certificate=client_cert
+                                )
+                                
+                                if is_valid:
+                                    print(f"✓ Client receipt verified: seq {client_receipt.first_seq}-{client_receipt.last_seq}")
+                                    print(f"  Transcript hash: {client_receipt.transcript_sha256[:16]}...")
+                                    
+                                    # Save client receipt to file
+                                    client_receipt_path = transcript_path.parent / f"{transcript_path.stem}_client_receipt.json"
+                                    receipt.save_receipt(client_receipt, client_receipt_path)
+                                    print(f"✓ Client receipt saved to: {client_receipt_path}")
+                                else:
+                                    print(f"✗ Client receipt verification failed: {error_msg}")
+                                
+                                # Generate and send server's receipt
+                                certs_dir = Path("certs")
+                                server_key_path = certs_dir / "server_key.pem"
+                                
+                                if server_key_path.exists():
+                                    server_receipt = receipt.generate_session_receipt(
+                                        transcript_path=transcript_path,
+                                        peer="server",
+                                        private_key_path=server_key_path
+                                    )
+                                    
+                                    if server_receipt:
+                                        client_socket.send(server_receipt.model_dump_json().encode('utf-8'))
+                                        print(f"✓ Server receipt sent: seq {server_receipt.first_seq}-{server_receipt.last_seq}")
+                                        print(f"  Transcript hash: {server_receipt.transcript_sha256[:16]}...")
+                                        
+                                        # Save receipt to file
+                                        receipt_path = transcript_path.parent / f"{transcript_path.stem}_server_receipt.json"
+                                        receipt.save_receipt(server_receipt, receipt_path)
+                                        print(f"✓ Server receipt saved to: {receipt_path}")
+                                
+                                # Session closure complete
+                                break
+                            
+                            except Exception as e:
+                                print(f"✗ Error processing receipt: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                break
+                        
                         else:
                             print(f"✗ Unknown message type after login: {msg_type}")
                             error = ErrorResponse(error="INVALID_MESSAGE")
@@ -317,6 +394,30 @@ def handle_client_connection(client_socket: socket.socket, client_address: tuple
                         except:
                             pass
                         break
+                
+                # Generate receipt on session closure (if transcript exists and no receipt was sent)
+                if transcript_path and transcript_path.exists():
+                    certs_dir = Path("certs")
+                    server_key_path = certs_dir / "server_key.pem"
+                    
+                    if server_key_path.exists():
+                        server_receipt = receipt.generate_session_receipt(
+                            transcript_path=transcript_path,
+                            peer_name="server",
+                            private_key_path=server_key_path
+                        )
+                        
+                        if server_receipt:
+                            print(f"\n✓ Session receipt generated:")
+                            print(f"  Peer: {server_receipt.peer}")
+                            print(f"  Sequence range: {server_receipt.first_seq}-{server_receipt.last_seq}")
+                            print(f"  Transcript hash: {server_receipt.transcript_sha256}")
+                            
+                            # Save receipt to file
+                            receipt_path = transcript_path.parent / f"{transcript_path.stem}_server_receipt.json"
+                            with open(receipt_path, "w") as f:
+                                f.write(server_receipt.model_dump_json(indent=2))
+                            print(f"  Receipt saved to: {receipt_path}")
                 
             else:
                 print(f"✗ Login failed: {message}")
