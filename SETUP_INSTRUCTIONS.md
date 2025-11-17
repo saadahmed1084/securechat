@@ -95,7 +95,7 @@ python -m venv .venv
 
 # Activate virtual environment
 # Windows:
-.venv\Scripts\activate
+.venv\Scripts\activate.bat
 # Linux/Mac:
 source .venv/bin/activate
 
@@ -137,7 +137,7 @@ SERVER_PORT=8888
 ```bash
 # Make sure virtual environment is activated
 # Windows:
-.venv\Scripts\activate
+.venv\Scripts\activate.bat
 # Linux/Mac:
 source .venv/bin/activate
 
@@ -192,7 +192,7 @@ cd securechat-skeleton-main
 
 # Activate virtual environment
 # Windows:
-.venv\Scripts\activate
+.venv\Scripts\activate.bat
 # Linux/Mac:
 source .venv/bin/activate
 
@@ -221,7 +221,7 @@ cd securechat-skeleton-main
 
 # Activate virtual environment
 # Windows:
-.venv\Scripts\activate
+.venv\Scripts\activate.bat
 # Linux/Mac:
 source .venv/bin/activate
 
@@ -246,7 +246,7 @@ In the same terminal (or a new one):
 ```bash
 # Make sure virtual environment is activated
 # Windows:
-.venv\Scripts\activate
+.venv\Scripts\activate.bat
 # Linux/Mac:
 source .venv/bin/activate
 
@@ -307,7 +307,7 @@ After a session, verify receipts for non-repudiation:
 ```bash
 # Make sure virtual environment is activated
 # Windows:
-.venv\Scripts\activate
+.venv\Scripts\activate.bat
 # Linux/Mac:
 source .venv/bin/activate
 
