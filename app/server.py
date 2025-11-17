@@ -14,10 +14,11 @@ from app.common.protocol import (
     Login,
     LoginResponse,
     SessionKeyEstablished,
+    Message,
     ErrorResponse,
 )
 from app.common.utils import b64d, b64e
-from app.crypto import auth, dh, pki
+from app.crypto import auth, dh, message, pki
 
 
 def load_server_certificate(cert_path: Path) -> bytes:
@@ -238,10 +239,84 @@ def handle_client_connection(client_socket: socket.socket, client_address: tuple
                 confirmation = SessionKeyEstablished(status="OK")
                 client_socket.send(confirmation.model_dump_json().encode('utf-8'))
                 
-                # Store session key for chat message encryption (in a real implementation,
-                # this would be stored in a session manager)
-                # For now, we'll keep the connection open and the session key in memory
+                # Store session key for chat message encryption
+                # Enter chat message handling loop
                 print(f"✓ Session established. Ready for chat messages.")
+                
+                # Track sequence numbers for replay protection
+                expected_seqno = 0
+                
+                # Chat message loop
+                while True:
+                    try:
+                        data = client_socket.recv(4096)
+                        if not data:
+                            print("✗ Client closed connection")
+                            break
+                        
+                        try:
+                            msg_json = json.loads(data.decode('utf-8'))
+                            msg_type = msg_json.get('type')
+                        except Exception as e:
+                            print(f"✗ Invalid message format: {e}")
+                            error = ErrorResponse(error="INVALID_MESSAGE")
+                            client_socket.send(error.model_dump_json().encode('utf-8'))
+                            continue
+                        
+                        if msg_type == "msg":
+                            # Handle chat message
+                            try:
+                                msg = Message.model_validate(msg_json)
+                            except Exception as e:
+                                print(f"✗ Invalid Message format: {e}")
+                                error = ErrorResponse(error="INVALID_MESSAGE")
+                                client_socket.send(error.model_dump_json().encode('utf-8'))
+                                continue
+                            
+                            # Decrypt and verify message
+                            success, plaintext, error_msg = message.decrypt_and_verify_message(
+                                seqno=msg.seqno,
+                                timestamp=msg.ts,
+                                ciphertext_b64=msg.ct,
+                                signature_b64=msg.sig,
+                                session_key=session_key,
+                                sender_certificate=client_cert,
+                                expected_seqno=expected_seqno
+                            )
+                            
+                            if success:
+                                expected_seqno = msg.seqno
+                                print(f"✓ Message [{msg.seqno}] from {pki.get_certificate_cn(client_cert)}: {plaintext}")
+                            else:
+                                print(f"✗ Message verification failed: {error_msg}")
+                                # Send error response
+                                if error_msg.startswith("REPLAY"):
+                                    error = ErrorResponse(error="REPLAY")
+                                elif error_msg.startswith("SIG_FAIL"):
+                                    error = ErrorResponse(error="SIG_FAIL")
+                                else:
+                                    error = ErrorResponse(error="INVALID_MESSAGE")
+                                client_socket.send(error.model_dump_json().encode('utf-8'))
+                                # Continue to receive next message
+                                continue
+                        else:
+                            print(f"✗ Unknown message type after login: {msg_type}")
+                            error = ErrorResponse(error="INVALID_MESSAGE")
+                            client_socket.send(error.model_dump_json().encode('utf-8'))
+                    
+                    except socket.error:
+                        print("✗ Socket error, closing connection")
+                        break
+                    except Exception as e:
+                        print(f"✗ Error processing chat message: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        error = ErrorResponse(error="INTERNAL_ERROR")
+                        try:
+                            client_socket.send(error.model_dump_json().encode('utf-8'))
+                        except:
+                            pass
+                        break
                 
             else:
                 print(f"✗ Login failed: {message}")

@@ -15,16 +15,159 @@ from app.common.protocol import (
     Login,
     LoginResponse,
     SessionKeyEstablished,
+    Message,
     ErrorResponse,
 )
 from app.common.utils import b64d, b64e
-from app.crypto import auth, dh, pki
+from app.crypto import auth, dh, message, pki
 
 
 def load_client_certificate(cert_path: Path) -> bytes:
     """Load client certificate from file."""
     with open(cert_path, "rb") as f:
         return f.read()
+
+
+def chat_loop(sock: socket.socket, session_key: bytes, client_key_path: Path):
+    """
+    Chat loop: send and receive encrypted messages.
+    
+    Args:
+        sock: Open socket connection to server
+        session_key: AES-128 session key for encryption
+        client_key_path: Path to client's private key for signing
+    """
+    import threading
+    
+    seqno = 0
+    expected_seqno = 0
+    
+    def receive_messages():
+        """Thread function to receive messages from server."""
+        nonlocal expected_seqno
+        while True:
+            try:
+                data = sock.recv(4096)
+                if not data:
+                    print("\n✗ Server closed connection")
+                    break
+                
+                try:
+                    msg_json = json.loads(data.decode('utf-8'))
+                    msg_type = msg_json.get('type')
+                except Exception as e:
+                    print(f"\n✗ Invalid message format: {e}")
+                    continue
+                
+                if msg_type == "msg":
+                    # Handle received chat message
+                    try:
+                        msg = Message.model_validate(msg_json)
+                    except Exception as e:
+                        print(f"\n✗ Invalid Message format: {e}")
+                        continue
+                    
+                    # Load server certificate for verification
+                    certs_dir = Path("certs")
+                    ca_cert_path = certs_dir / "ca_cert.pem"
+                    server_cert_path = certs_dir / "server_cert.pem"
+                    
+                    if not server_cert_path.exists():
+                        print("\n✗ Server certificate not found")
+                        continue
+                    
+                    from cryptography import x509
+                    with open(server_cert_path, "rb") as f:
+                        server_cert = x509.load_pem_x509_certificate(f.read())
+                    
+                    # Decrypt and verify message
+                    success, plaintext, error_msg = message.decrypt_and_verify_message(
+                        seqno=msg.seqno,
+                        timestamp=msg.ts,
+                        ciphertext_b64=msg.ct,
+                        signature_b64=msg.sig,
+                        session_key=session_key,
+                        sender_certificate=server_cert,
+                        expected_seqno=expected_seqno
+                    )
+                    
+                    if success:
+                        expected_seqno = msg.seqno
+                        print(f"\n[Server] [{msg.seqno}]: {plaintext}")
+                    else:
+                        print(f"\n✗ Message verification failed: {error_msg}")
+                
+                elif msg_type == "error":
+                    error = ErrorResponse.model_validate(msg_json)
+                    print(f"\n✗ Server error: {error.error}")
+                    if error.error in ["REPLAY", "SIG_FAIL"]:
+                        print("  Connection may be compromised, consider reconnecting")
+            
+            except socket.error:
+                print("\n✗ Socket error, closing connection")
+                break
+            except Exception as e:
+                print(f"\n✗ Error receiving message: {e}")
+                break
+    
+    # Start receive thread
+    receive_thread = threading.Thread(target=receive_messages, daemon=True)
+    receive_thread.start()
+    
+    # Main send loop
+    print("\n✓ Entering chat mode. Type messages and press Enter to send.")
+    print("  Type 'quit' or 'exit' to disconnect.\n")
+    
+    try:
+        while True:
+            try:
+                # Read input from console
+                plaintext = input()
+                
+                if plaintext.lower() in ['quit', 'exit']:
+                    print("Disconnecting...")
+                    break
+                
+                if not plaintext.strip():
+                    continue
+                
+                # Increment sequence number
+                seqno += 1
+                
+                # Encrypt and sign message
+                timestamp, ciphertext_b64, signature_b64 = message.encrypt_and_sign_message(
+                    plaintext=plaintext,
+                    seqno=seqno,
+                    session_key=session_key,
+                    private_key_path=client_key_path
+                )
+                
+                # Create and send message
+                msg = Message(
+                    seqno=seqno,
+                    ts=timestamp,
+                    ct=ciphertext_b64,
+                    sig=signature_b64
+                )
+                
+                sock.send(msg.model_dump_json().encode('utf-8'))
+                print(f"✓ Message [{seqno}] sent")
+            
+            except EOFError:
+                # Handle Ctrl+D
+                print("\nDisconnecting...")
+                break
+            except KeyboardInterrupt:
+                # Handle Ctrl+C
+                print("\nDisconnecting...")
+                break
+            except Exception as e:
+                print(f"\n✗ Error sending message: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    finally:
+        sock.close()
 
 
 def connect_and_authenticate(
@@ -357,12 +500,20 @@ def main():
     
     if success and args.action == "login" and session_key is not None:
         print(f"\n✓ Authentication and session key establishment complete")
-        print(f"  Session key: {session_key.hex()}")
-        print(f"  Socket is ready for chat messages")
-        # In a real implementation, you would keep the socket open and use it for chat
-        # For now, we'll close it after demonstrating the session key establishment
-        if sock:
-            sock.close()
+        print(f"  Session key: {session_key.hex()[:16]}...")
+        
+        # Enter chat mode
+        certs_dir = Path("certs")
+        client_key_path = certs_dir / "client_key.pem"
+        
+        if not client_key_path.exists():
+            print(f"✗ Client private key not found: {client_key_path}")
+            if sock:
+                sock.close()
+            sys.exit(1)
+        
+        # Start chat loop
+        chat_loop(sock, session_key, client_key_path)
     
     sys.exit(0 if success else 1)
 

@@ -60,11 +60,12 @@ class SessionKeyEstablished(BaseModel):
 
 
 class Message(BaseModel):
-    """Chat message."""
+    """Chat message with encryption and signature."""
     type: str = Field(default="msg", description="Message type")
     seqno: int = Field(description="Sequence number")
-    encrypted_payload: str = Field(description="Encrypted message payload (base64 encoded)")
-    signature: str = Field(description="Message signature (base64 encoded)")
+    ts: int = Field(description="Unix timestamp in milliseconds")
+    ct: str = Field(description="Encrypted ciphertext (base64 encoded)")
+    sig: str = Field(description="RSA signature of SHA256(seqno||ts||ct) (base64 encoded)")
 
 
 class Receipt(BaseModel):
