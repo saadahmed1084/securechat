@@ -137,11 +137,11 @@ def handle_secure_login(
         return False, f"Malformed login payload: {exc}"
 
     try:
-        is_valid = db.verify_user(username=username, password=password)
+        result = db.verify_user(username=username, password=password)
     except Exception as exc:  # pragma: no cover
         return False, f"Database error: {exc}"
 
-    if not is_valid:
+    if result is None:
         return False, "Invalid credentials"
 
     return True, "OK"

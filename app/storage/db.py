@@ -95,6 +95,7 @@ def compute_password_hash(password: str, salt: bytes) -> str:
 def register_user(email: str, username: str, password: str) -> bool:
     """
     Register a new user with salted password hash.
+    Verifies that username or email is not already registered.
     
     Args:
         email: User's email address
@@ -102,17 +103,26 @@ def register_user(email: str, username: str, password: str) -> bool:
         password: Plaintext password
         
     Returns:
-        True if registration successful, False if username already exists
+        True if registration successful, False if username or email already exists
     """
     conn = get_db_connection()
     try:
-        # Generate salt
-        salt = generate_salt()
-        
-        # Compute password hash
-        pwd_hash = compute_password_hash(password, salt)
-        
         with conn.cursor() as cursor:
+            # Check if username or email already exists
+            cursor.execute("""
+                SELECT 1
+                FROM users
+                WHERE username = %s OR email = %s
+            """, (username, email))
+            if cursor.fetchone():
+                return False
+            
+            # Generate salt
+            salt = generate_salt()
+            
+            # Compute password hash
+            pwd_hash = compute_password_hash(password, salt)
+            
             # Insert user
             cursor.execute("""
                 INSERT INTO users (email, username, salt, pwd_hash)
@@ -121,7 +131,7 @@ def register_user(email: str, username: str, password: str) -> bool:
         conn.commit()
         return True
     except pymysql.err.IntegrityError:
-        # Username already exists
+        # Should not happen if we check first, but handle just in case
         return False
     except Exception as e:
         print(f"Error registering user: {e}")
