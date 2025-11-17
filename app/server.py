@@ -13,6 +13,7 @@ from app.common.protocol import (
     RegisterResponse,
     Login,
     LoginResponse,
+    SessionKeyEstablished,
     ErrorResponse,
 )
 from app.common.utils import b64d, b64e
@@ -193,11 +194,59 @@ def handle_client_connection(client_socket: socket.socket, client_address: tuple
             if success:
                 print(f"✓ User logged in successfully")
                 response = LoginResponse(status="OK")
+                client_socket.send(response.model_dump_json().encode('utf-8'))
+                
+                # Step 8: Establish session key for chat messages (new DH exchange)
+                print(f"→ Establishing session key for chat...")
+                
+                # Receive client's session DH public key
+                data = client_socket.recv(4096)
+                if not data:
+                    print("✗ Client closed connection during session key establishment")
+                    return
+                
+                try:
+                    session_dh_client_msg = DHClient.model_validate_json(data.decode('utf-8'))
+                except Exception as e:
+                    print(f"✗ Invalid SessionDHClient message: {e}")
+                    error = ErrorResponse(error="INVALID_MESSAGE")
+                    client_socket.send(error.model_dump_json().encode('utf-8'))
+                    return
+                
+                # Deserialize client's session DH public key
+                client_session_dh_pubkey_data = b64d(session_dh_client_msg.dh_pubkey)
+                client_session_dh_pubkey = dh.deserialize_public_key(client_session_dh_pubkey_data)
+                
+                # Generate server session DH keypair
+                server_session_dh_private, server_session_dh_public = dh.generate_dh_keypair()
+                server_session_dh_pubkey_data = dh.serialize_public_key(server_session_dh_public)
+                server_session_dh_pubkey_b64 = b64e(server_session_dh_pubkey_data)
+                
+                # Send server's session DH public key
+                session_dh_server_msg = DHServer(dh_pubkey=server_session_dh_pubkey_b64)
+                client_socket.send(session_dh_server_msg.model_dump_json().encode('utf-8'))
+                
+                # Compute session key: K = Trunc16(SHA256(big-endian(Ks)))
+                session_shared_secret = dh.compute_shared_secret(
+                    server_session_dh_private, 
+                    client_session_dh_pubkey
+                )
+                session_key = dh.derive_aes_key(session_shared_secret)
+                print(f"✓ Session key established: {session_key.hex()[:16]}...")
+                
+                # Send confirmation
+                confirmation = SessionKeyEstablished(status="OK")
+                client_socket.send(confirmation.model_dump_json().encode('utf-8'))
+                
+                # Store session key for chat message encryption (in a real implementation,
+                # this would be stored in a session manager)
+                # For now, we'll keep the connection open and the session key in memory
+                print(f"✓ Session established. Ready for chat messages.")
+                
             else:
                 print(f"✗ Login failed: {message}")
                 response = LoginResponse(status=message)
-            
-            client_socket.send(response.model_dump_json().encode('utf-8'))
+                client_socket.send(response.model_dump_json().encode('utf-8'))
         else:
             print(f"✗ Unknown message type: {msg_type}")
             error = ErrorResponse(error="INVALID_MESSAGE")

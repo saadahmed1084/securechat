@@ -53,6 +53,12 @@ class LoginResponse(BaseModel):
     status: str = Field(description="Status: 'OK' or error message")
 
 
+class SessionKeyEstablished(BaseModel):
+    """Confirmation that session key has been established."""
+    type: str = Field(default="session_key_established", description="Message type")
+    status: str = Field(default="OK", description="Status: 'OK' or error message")
+
+
 class Message(BaseModel):
     """Chat message."""
     type: str = Field(default="msg", description="Message type")

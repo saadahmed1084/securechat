@@ -14,6 +14,7 @@ from app.common.protocol import (
     RegisterResponse,
     Login,
     LoginResponse,
+    SessionKeyEstablished,
     ErrorResponse,
 )
 from app.common.utils import b64d, b64e
@@ -33,7 +34,7 @@ def connect_and_authenticate(
     email: Optional[str] = None,
     username: str = None,
     password: str = None,
-) -> bool:
+) -> tuple[bool, Optional[bytes], Optional[socket.socket]]:
     """
     Connect to server, perform certificate exchange, DH key exchange, and authenticate.
     
@@ -46,7 +47,10 @@ def connect_and_authenticate(
         password: Password
         
     Returns:
-        True if successful, False otherwise
+        Tuple of (success, session_key, socket)
+        - success: True if successful, False otherwise
+        - session_key: Session key bytes if login successful, None otherwise
+        - socket: Open socket if login successful (for chat), None otherwise
     """
     # Load client certificate
     certs_dir = Path("certs")
@@ -71,7 +75,7 @@ def connect_and_authenticate(
         print(f"✓ Connected to server {server_host}:{server_port}")
     except Exception as e:
         print(f"✗ Failed to connect to server: {e}")
-        return False
+        return False, None, None
     
     try:
         # Step 1: Send Hello with client certificate
@@ -82,13 +86,13 @@ def connect_and_authenticate(
         data = sock.recv(4096)
         if not data:
             print("✗ Server closed connection")
-            return False
+            return False, None, None
         
         try:
             server_hello = ServerHello.model_validate_json(data.decode('utf-8'))
         except Exception as e:
             print(f"✗ Invalid ServerHello message: {e}")
-            return False
+            return False, None, None
         
         # Validate server certificate
         server_cert_data = b64d(server_hello.cert)
@@ -100,7 +104,7 @@ def connect_and_authenticate(
         
         if status != "OK":
             print(f"✗ Server certificate validation failed: {status}")
-            return False
+            return False, None, None
         
         print(f"✓ Server certificate validated: {pki.get_certificate_cn(server_cert)}")
         
@@ -116,13 +120,13 @@ def connect_and_authenticate(
         data = sock.recv(4096)
         if not data:
             print("✗ Server closed connection")
-            return False
+            return False, None, None
         
         try:
             dh_server_msg = DHServer.model_validate_json(data.decode('utf-8'))
         except Exception as e:
             print(f"✗ Invalid DHServer message: {e}")
-            return False
+            return False, None, None
         
         # Deserialize server's DH public key
         server_dh_pubkey_data = b64d(dh_server_msg.dh_pubkey)
@@ -137,7 +141,7 @@ def connect_and_authenticate(
         if action == "register":
             if not email or not username or not password:
                 print("✗ Registration requires email, username, and password")
-                return False
+                return False, None, None
             
             encrypted_data = auth.encrypt_registration_payload(
                 email=email,
@@ -153,7 +157,8 @@ def connect_and_authenticate(
             data = sock.recv(4096)
             if not data:
                 print("✗ Server closed connection")
-                return False
+                sock.close()
+                return False, None, None
             
             try:
                 response = RegisterResponse.model_validate_json(data.decode('utf-8'))
@@ -162,22 +167,26 @@ def connect_and_authenticate(
                 try:
                     error = ErrorResponse.model_validate_json(data.decode('utf-8'))
                     print(f"✗ Server error: {error.error}")
-                    return False
+                    sock.close()
+                    return False, None, None
                 except:
                     print(f"✗ Invalid response: {e}")
-                    return False
+                    sock.close()
+                    return False, None, None
             
             if response.status == "OK":
                 print(f"✓ Registration successful")
-                return True
+                sock.close()
+                return True, None, None
             else:
                 print(f"✗ Registration failed: {response.status}")
-                return False
+                sock.close()
+                return False, None, None
         
         elif action == "login":
             if not username or not password:
                 print("✗ Login requires username and password")
-                return False
+                return False, None, None
             
             encrypted_data = auth.encrypt_login_payload(
                 username=username,
@@ -192,7 +201,8 @@ def connect_and_authenticate(
             data = sock.recv(4096)
             if not data:
                 print("✗ Server closed connection")
-                return False
+                sock.close()
+                return False, None, None
             
             try:
                 response = LoginResponse.model_validate_json(data.decode('utf-8'))
@@ -201,28 +211,91 @@ def connect_and_authenticate(
                 try:
                     error = ErrorResponse.model_validate_json(data.decode('utf-8'))
                     print(f"✗ Server error: {error.error}")
-                    return False
+                    sock.close()
+                    return False, None, None
                 except:
                     print(f"✗ Invalid response: {e}")
-                    return False
+                    sock.close()
+                    return False, None, None
             
             if response.status == "OK":
                 print(f"✓ Login successful")
-                return True
+                
+                # Step 7: Establish session key for chat messages (new DH exchange)
+                print(f"→ Establishing session key for chat...")
+                
+                # Generate client session DH keypair
+                client_session_dh_private, client_session_dh_public = dh.generate_dh_keypair()
+                client_session_dh_pubkey_data = dh.serialize_public_key(client_session_dh_public)
+                client_session_dh_pubkey_b64 = b64e(client_session_dh_pubkey_data)
+                
+                # Send client's session DH public key
+                session_dh_client_msg = DHClient(dh_pubkey=client_session_dh_pubkey_b64)
+                sock.send(session_dh_client_msg.model_dump_json().encode('utf-8'))
+                
+                # Receive server's session DH public key
+                data = sock.recv(4096)
+                if not data:
+                    print("✗ Server closed connection during session key establishment")
+                    sock.close()
+                    return False, None, None
+                
+                try:
+                    session_dh_server_msg = DHServer.model_validate_json(data.decode('utf-8'))
+                except Exception as e:
+                    print(f"✗ Invalid SessionDHServer message: {e}")
+                    sock.close()
+                    return False, None, None
+                
+                # Deserialize server's session DH public key
+                server_session_dh_pubkey_data = b64d(session_dh_server_msg.dh_pubkey)
+                server_session_dh_pubkey = dh.deserialize_public_key(server_session_dh_pubkey_data)
+                
+                # Compute session key: K = Trunc16(SHA256(big-endian(Ks)))
+                session_shared_secret = dh.compute_shared_secret(
+                    client_session_dh_private,
+                    server_session_dh_pubkey
+                )
+                session_key = dh.derive_aes_key(session_shared_secret)
+                print(f"✓ Session key established: {session_key.hex()[:16]}...")
+                
+                # Receive confirmation
+                data = sock.recv(4096)
+                if not data:
+                    print("✗ Server closed connection")
+                    sock.close()
+                    return False, None, None
+                
+                try:
+                    confirmation = SessionKeyEstablished.model_validate_json(data.decode('utf-8'))
+                except Exception as e:
+                    print(f"✗ Invalid SessionKeyEstablished message: {e}")
+                    sock.close()
+                    return False, None, None
+                
+                if confirmation.status == "OK":
+                    print(f"✓ Session established. Ready for chat messages.")
+                    # Return success with session key and open socket
+                    return True, session_key, sock
+                else:
+                    print(f"✗ Session key establishment failed: {confirmation.status}")
+                    sock.close()
+                    return False, None, None
             else:
                 print(f"✗ Login failed: {response.status}")
-                return False
+                sock.close()
+                return False, None, None
         else:
             print(f"✗ Unknown action: {action}")
-            return False
+            return False, None, None
     
     except Exception as e:
         print(f"✗ Error during authentication: {e}")
         import traceback
         traceback.print_exc()
-        return False
-    finally:
-        sock.close()
+        if sock:
+            sock.close()
+        return False, None, None
 
 
 def main():
@@ -273,7 +346,7 @@ def main():
         print("✗ Email is required for registration")
         sys.exit(1)
     
-    success = connect_and_authenticate(
+    success, session_key, sock = connect_and_authenticate(
         server_host=args.host,
         server_port=args.port,
         action=args.action,
@@ -281,6 +354,15 @@ def main():
         username=args.username,
         password=args.password,
     )
+    
+    if success and args.action == "login" and session_key is not None:
+        print(f"\n✓ Authentication and session key establishment complete")
+        print(f"  Session key: {session_key.hex()}")
+        print(f"  Socket is ready for chat messages")
+        # In a real implementation, you would keep the socket open and use it for chat
+        # For now, we'll close it after demonstrating the session key establishment
+        if sock:
+            sock.close()
     
     sys.exit(0 if success else 1)
 
