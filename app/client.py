@@ -4,6 +4,7 @@ import os
 import socket
 import sys
 from pathlib import Path
+from typing import Optional
 
 from app.common.protocol import (
     Hello,
@@ -322,11 +323,11 @@ def connect_and_authenticate(
     
     if not client_cert_path.exists():
         print(f"✗ Client certificate not found: {client_cert_path}")
-        return False
+        return False, None, None
     
     if not ca_cert_path.exists():
         print(f"✗ CA certificate not found: {ca_cert_path}")
-        return False
+        return False, None, None
     
     client_cert_data = load_client_certificate(client_cert_path)
     client_cert_b64 = b64e(client_cert_data)

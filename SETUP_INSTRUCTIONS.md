@@ -165,8 +165,8 @@ Expected output:
 # Generate Root CA certificate
 python scripts/gen_ca.py --name "FAST-NU Root CA"
 
-# Generate server certificate
-python scripts/gen_cert.py --cn server.local --out certs/server
+# Generate server certificate (CN = localhost)
+python scripts/gen_cert.py --cn localhost --out certs/server
 
 # Generate client certificate
 python scripts/gen_cert.py --cn client.local --out certs/client
@@ -232,7 +232,7 @@ python -m app.client --action register --email user@example.com --username alice
 Expected output:
 ```
 ✓ Connected to server localhost:8888
-✓ Server certificate validated: server.local
+✓ Server certificate validated: localhost
 ✓ AES key derived from DH exchange
 ✓ Registration successful
 ```
